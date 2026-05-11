@@ -1,252 +1,392 @@
-# vector_tool_router_gigachat_demo.py
-#
-# pip install -U deepagents langchain langchain-core langchain-gigachat
-#
-# env example:
-#   export GIGACHAT_CREDENTIALS="..."
-#   export GIGACHAT_SCOPE="GIGACHAT_API_PERS"
-#   export GIGACHAT_BASE_URL="https://your-gigachat-api-url"
-#   export GIGACHAT_MODEL="GigaChat-2-Max"
-#   export GIGACHAT_EMBEDDING_MODEL="Embeddings"
-
+# two_phase_deepagents_poc.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
-import math
 import os
+from typing import Any, Callable, Literal, Sequence
+
+from typing_extensions import NotRequired
 
 from deepagents import create_deep_agent
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    AgentState,
+    ModelRequest,
+    ModelResponse,
+    hook_config,
+)
+from langchain.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.documents import Document
-from langchain_core.tools import tool
-from langchain_gigachat import GigaChat, GigaChatEmbeddings
+from langchain_core.tools import BaseTool, tool
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_gigachat import GigaChat, GigaEmbeddings
 
 
-# ----------------------------
-# 1. GigaChat embeddings adapter
-# ----------------------------
+# ---------------------------------------------------------------------
+# Model / embeddings
+# ---------------------------------------------------------------------
 
-class CallableGigaEmbeddings(GigaChatEmbeddings):
-    """
-    Compatibility adapter.
-
-    Some LangChain/vectorstore integrations expect embedding_function(texts)
-    in addition to standard embed_documents/embed_query.
-    """
-
-    def __call__(self, input):
-        if isinstance(input, str):
-            return self.embed_query(input)
-        return self.embed_documents(list(input))
-
-
-# ----------------------------
-# 2. Business tools
-# ----------------------------
-
-@tool
-def search_docs(query: str) -> str:
-    """Search documentation, knowledge base, API docs, incidents, TLS errors, certificates."""
-    return (
-        "Docs result: TLS hostname mismatch usually means the certificate SAN "
-        "does not contain the requested hostname. Check SAN, DNS name, chain, "
-        "truststore, and mTLS client certificate."
+def build_gigachat() -> GigaChat:
+    return GigaChat(
+        credentials=os.environ.get("GIGACHAT_CREDENTIALS", ""),
+        base_url=os.environ.get("GIGACHAT_API_BASE", ""),
+        scope=os.environ.get("GIGACHAT_SCOPE", ""),
+        model=os.environ.get("GIGACHAT_MODEL", ""),
+        temperature=float(os.environ.get("GIGACHAT_TEMPERATURE", "0")),
+        timeout=int(os.environ.get("GIGACHAT_TIMEOUT", "120")),
+        verify_ssl_certs=False,
+        profanity_check=False,
     )
 
 
-@tool
-def make_checklist(service: str, problem: str) -> str:
-    """Create a short troubleshooting checklist or incident investigation plan."""
-    return (
-        f"Checklist for {service} / {problem}:\n"
-        "1. Check application and gateway logs.\n"
-        "2. Check certificate SAN.\n"
-        "3. Check certificate chain.\n"
-        "4. Check gateway truststore.\n"
-        "5. Check mTLS client certificate.\n"
-        "6. Check route/upstream config.\n"
-        "7. Then check auth token and scope."
+def build_embeddings() -> GigaEmbeddings:
+    return GigaEmbeddings(
+        credentials=os.environ.get("GIGACHAT_CREDENTIALS", ""),
+        base_url=os.environ.get("GIGACHAT_API_BASE", ""),
+        scope=os.environ.get("GIGACHAT_SCOPE", ""),
+        model=os.environ.get("GIGACHAT_EMBEDDING_MODEL", ""),
+        verify_ssl_certs=False,
     )
 
 
-TOOLS = [search_docs, make_checklist]
-TOOL_NAMES = {t.name for t in TOOLS}
+# ---------------------------------------------------------------------
+# Business tools: self-sufficient, no knowledge vectorstore
+# ---------------------------------------------------------------------
 
-
-# ----------------------------
-# 3. Tool cards for vector search
-# ----------------------------
-
-def tool_to_document(tool) -> Document:
-    schema = ""
-    if getattr(tool, "args_schema", None) is not None:
-        schema = json.dumps(
-            tool.args_schema.model_json_schema(),
-            ensure_ascii=False,
+def build_business_tools() -> list[BaseTool]:
+    @tool
+    def search(query: str) -> str:
+        """
+        Search an external or internal system for relevant information.
+        Use this when the answer requires data lookup.
+        """
+        # PoC stub. In real code this may call DB, API, MCP, retriever, etc.
+        return (
+            f"Search results for: {query}\n"
+            "- No real backend is connected in this PoC.\n"
+            "- Replace this body with your own search implementation."
         )
 
-    return Document(
-        page_content=f"""
-Tool name: {tool.name}
+    @tool
+    def checklist(topic: str) -> str:
+        """
+        Produce a practical diagnostic checklist.
+        Use this when the user needs structured troubleshooting steps or an action plan.
+        """
+        return (
+            f"Checklist for: {topic}\n"
+            "1. Clarify the exact symptom and expected behavior.\n"
+            "2. Check the latest deployment, config, credentials, and routes.\n"
+            "3. Check readiness, health endpoints, and dependency availability.\n"
+            "4. Inspect logs around the first failure timestamp.\n"
+            "5. Reproduce with the smallest possible request.\n"
+            "6. Isolate whether the issue is client-side, gateway-side, or upstream.\n"
+            "7. Record findings, owner, and next action."
+        )
 
-Description:
-{tool.description}
-
-Input schema:
-{schema}
-""".strip(),
-        metadata={"tool_name": tool.name},
-    )
-
-
-# ----------------------------
-# 4. Very simple in-memory vectorstore
-# ----------------------------
-
-class SimpleVectorStore:
-    def __init__(self, embeddings):
-        self.embeddings = embeddings
-        self.items = []
-
-    def add_documents(self, docs: list[Document]) -> None:
-        vectors = self.embeddings.embed_documents([doc.page_content for doc in docs])
-        self.items.extend(zip(docs, vectors))
-
-    def similarity_search(self, query: str, k: int = 1) -> list[Document]:
-        query_vector = self.embeddings.embed_query(query)
-
-        scored = [
-            (self.cosine(query_vector, vector), doc)
-            for doc, vector in self.items
-        ]
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        return [doc for _, doc in scored[:k]]
-
-    def as_retriever(self, k: int = 1):
-        return SimpleRetriever(self, k)
-
-    def cosine(self, a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a)) or 1.0
-        norm_b = math.sqrt(sum(y * y for y in b)) or 1.0
-        return dot / (norm_a * norm_b)
+    return [search, checklist]
 
 
-class SimpleRetriever:
-    def __init__(self, vectorstore: SimpleVectorStore, k: int = 1):
-        self.vectorstore = vectorstore
-        self.k = k
+# ---------------------------------------------------------------------
+# Runtime vector index over business tools only
+# ---------------------------------------------------------------------
 
-    def invoke(self, query: str) -> list[Document]:
-        return self.vectorstore.similarity_search(query, k=self.k)
+class VectorToolSelector:
+    def __init__(
+        self,
+        embeddings: GigaEmbeddings,
+        business_tools: Sequence[BaseTool],
+    ):
+        self.tools_by_name = {t.name: t for t in business_tools}
+        self.vectorstore = InMemoryVectorStore(embedding=embeddings)
 
+        self.vectorstore.add_documents(
+            [
+                Document(
+                    page_content=self._tool_text(t),
+                    metadata={"tool_name": t.name},
+                )
+                for t in business_tools
+            ]
+        )
 
-# ----------------------------
-# 5. Middleware: vector-based tool routing
-# ----------------------------
+    def select(
+        self,
+        query: str,
+        candidate_tools: Sequence[BaseTool],
+        k: int,
+    ) -> list[BaseTool]:
+        candidate_names = {t.name for t in candidate_tools}
 
-def last_user_text(messages) -> str:
-    for msg in reversed(messages):
-        role = getattr(msg, "type", None) or getattr(msg, "role", None)
-        if role in {"human", "user"}:
-            return str(getattr(msg, "content", ""))
-    return ""
+        docs = self.vectorstore.similarity_search(
+            query=query,
+            k=max(k, len(self.tools_by_name)),
+        )
 
-
-class VectorToolRouter(AgentMiddleware):
-    def __init__(self, tool_retriever, tool_names: set[str], fallback_tool: str):
-        self.tool_retriever = tool_retriever
-        self.tool_names = tool_names
-        self.fallback_tool = fallback_tool
-
-    def wrap_model_call(self, request, handler):
-        query = last_user_text(request.messages)
-
-        selected = {
-            doc.metadata["tool_name"]
-            for doc in self.tool_retriever.invoke(query)
-            if doc.metadata.get("tool_name") in self.tool_names
-        } or {self.fallback_tool}
-
-        visible_tools = [
-            tool for tool in request.tools
-            if tool.name not in self.tool_names or tool.name in selected
+        selected = [
+            self.tools_by_name[name]
+            for doc in docs
+            if (name := doc.metadata.get("tool_name")) in candidate_names
+            and name in self.tools_by_name
         ]
 
-        print("[tool-router] query:", query)
-        print("[tool-router] selected:", sorted(selected))
-        print("[tool-router] visible:", [tool.name for tool in visible_tools])
+        return selected[:k] or list(candidate_tools)[:k]
 
-        return handler(request.override(tools=visible_tools))
+    def _tool_text(self, tool_obj: BaseTool) -> str:
+        return (
+            f"name: {tool_obj.name}\n"
+            f"description: {tool_obj.description or ''}\n"
+            f"args: {json.dumps(tool_obj.args, ensure_ascii=False, default=str)}"
+        )
 
 
-# ----------------------------
-# 6. Build model, embeddings, index, agent
-# ----------------------------
+# ---------------------------------------------------------------------
+# Two-phase middleware
+# ---------------------------------------------------------------------
 
-def build_gigachat_common_kwargs() -> dict:
-    return {
-        "credentials": os.environ["GIGACHAT_CREDENTIALS"],
-        "scope": os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
-        "base_url": os.environ.get("GIGACHAT_BASE_URL"),
-        "verify_ssl_certs": os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "false").lower() == "true",
+HARNESS_TOOL_NAMES = {
+    "write_todos",
+    "ls",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+    "task",
+}
+
+
+class TwoPhaseState(AgentState):
+    tool_phase: NotRequired[Literal["business", "harness"]]
+    model_call_count: NotRequired[int]
+
+class TwoPhaseToolRouter(AgentMiddleware[TwoPhaseState]):
+    """
+    business phase:
+      expose only vector-selected business tools
+
+    harness phase:
+      expose only DeepAgents harness tools
+
+    The point is to avoid showing weak models business tools and harness tools
+    at the same time.
+    """
+
+    state_schema = TwoPhaseState
+
+    PHASE_INSTRUCTIONS = {
+        "business": (
+            "BUSINESS PHASE.\n"
+            "Only selected business tools are visible now.\n"
+            "Use search for lookup. Use checklist for structured diagnostic steps. "
+            "If no tool is needed, answer directly."
+        ),
+        "harness": (
+            "HARNESS PHASE.\n"
+            "Only harness tools are visible now.\n"
+            "Use at most one harness tool if useful for todos, notes, files, or delegation. "
+            "Do not use business tools here.\n"
+            "If no harness action is useful, answer exactly: NO_HARNESS_ACTION."
+        ),
     }
 
+    def __init__(
+        self,
+        selector: VectorToolSelector,
+        business_tool_names: set[str],
+        max_business_tools: int = 2,
+        max_model_calls: int = 12,
+    ):
+        self.selector = selector
+        self.business_tool_names = business_tool_names
+        self.max_business_tools = max_business_tools
+        self.max_model_calls = max_model_calls
 
-def main():
-    common_kwargs = build_gigachat_common_kwargs()
+    @hook_config(can_jump_to=["end"])
+    def before_model(
+        self,
+        state: TwoPhaseState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        count = state.get("model_call_count", 0) + 1
 
-    llm = GigaChat(
-        **common_kwargs,
-        model=os.environ.get("GIGACHAT_MODEL", "GigaChat-2-Max"),
-        temperature=0,
-        function_ranker={"enabled": False},
-        allow_any_tool_choice_fallback=True,
-    )
+        if count > self.max_model_calls:
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "Stopped: two-phase tool loop exceeded "
+                            f"{self.max_model_calls} model calls."
+                        )
+                    )
+                ],
+                "jump_to": "end",
+            }
 
-    embeddings = CallableGigaEmbeddings(
-        **common_kwargs,
-        model=os.environ.get("GIGACHAT_EMBEDDING_MODEL", "Embeddings"),
-    )
+        return {
+            "model_call_count": count,
+            "tool_phase": state.get("tool_phase", "business"),
+        }
 
-    tool_docs = [tool_to_document(tool) for tool in TOOLS]
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        phase = request.state.get("tool_phase", "business")
+        all_tools = list(request.tools or [])
 
-    vectorstore = SimpleVectorStore(embeddings)
-    vectorstore.add_documents(tool_docs)
+        business_tools = [
+            tool for tool in all_tools
+            if tool.name in self.business_tool_names
+        ]
 
-    tool_retriever = vectorstore.as_retriever(k=1)
+        harness_tools = [
+            tool for tool in all_tools
+            if tool.name in HARNESS_TOOL_NAMES
+        ]
 
-    agent = create_deep_agent(
-        model=llm,
-        tools=TOOLS,
-        middleware=[
-            VectorToolRouter(
-                tool_retriever=tool_retriever,
-                tool_names=TOOL_NAMES,
-                fallback_tool="search_docs",
+        phase_tools = {
+            "business": lambda: self.selector.select(
+                query=self._last_user_text(request),
+                candidate_tools=business_tools,
+                k=self.max_business_tools,
+            ),
+            "harness": lambda: harness_tools,
+        }
+
+        routed = request.override(tools=phase_tools[phase]())
+        routed = self._append_system_instruction(
+            routed,
+            self.PHASE_INSTRUCTIONS[phase],
+        )
+
+        return handler(routed)
+
+    @hook_config(can_jump_to=["model"])
+    def after_model(
+        self,
+        state: TwoPhaseState,
+        runtime: Any,
+    ) -> dict[str, Any] | None:
+        phase = state.get("tool_phase", "business")
+        messages = state.get("messages", [])
+
+        did_call_tool = bool(
+            messages
+            and (getattr(messages[-1], "tool_calls", None) or [])
+        )
+
+        if phase == "business" and did_call_tool:
+            return {"tool_phase": "harness"}
+
+        if phase == "harness":
+            update: dict[str, Any] = {"tool_phase": "business"}
+
+            if not did_call_tool:
+                update["jump_to"] = "model"
+
+            return update
+
+        return None
+
+    def _last_user_text(self, request: ModelRequest) -> str:
+        for message in reversed(request.messages):
+            if getattr(message, "type", None) == "human":
+                content = getattr(message, "content", "")
+                return content if isinstance(content, str) else str(content)
+
+        return ""
+
+    def _append_system_instruction(
+        self,
+        request: ModelRequest,
+        text: str,
+    ) -> ModelRequest:
+        if request.system_message is None:
+            return request.override(
+                system_message=SystemMessage(content=text)
             )
-        ],
-        system_prompt="Use available tools when useful. Answer briefly.",
+
+        content = list(request.system_message.content_blocks)
+        content.append({"type": "text", "text": text})
+
+        return request.override(
+            system_message=SystemMessage(content=content)
+        )
+# ---------------------------------------------------------------------
+# Agent factory
+# ---------------------------------------------------------------------
+
+def build_agent(
+    llm: GigaChat,
+    embeddings: GigaEmbeddings,
+) -> Any:
+    business_tools = build_business_tools()
+
+    selector = VectorToolSelector(
+        embeddings=embeddings,
+        business_tools=business_tools,
+    )
+
+    router = TwoPhaseToolRouter(
+        selector=selector,
+        business_tool_names={t.name for t in business_tools},
+        max_business_tools=2,
+        max_model_calls=int(os.environ.get("MAX_MODEL_CALLS", "12")),
+    )
+
+    return create_deep_agent(
+        model=llm,
+        tools=business_tools,
+        middleware=[router],
+        system_prompt=(
+            "You are a technical assistant. "
+            "The runtime alternates between business-tool and harness-tool phases."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------
+
+def last_useful_ai_text(result: dict[str, Any]) -> str:
+    for message in reversed(result.get("messages", [])):
+        if getattr(message, "type", None) != "ai":
+            continue
+
+        content = getattr(message, "content", "")
+
+        if content and content != "NO_HARNESS_ACTION":
+            return content if isinstance(content, str) else str(content)
+
+    return str(result)
+
+
+def main() -> None:
+    agent = build_agent(
+        llm=build_gigachat(),
+        embeddings=build_embeddings(),
     )
 
     result = agent.invoke(
         {
             "messages": [
-                {
-                    "role": "user",
-                    "content": "Составь план проверки Sber API после TLS hostname mismatch.",
-                }
-            ]
-        },
-        config={
-            "configurable": {"thread_id": "vector-tool-router-demo-1"},
-            "tags": ["gigachat", "deep-agent", "vector-tool-routing"],
-        },
+                HumanMessage(
+                    content=(
+                        "У нас после деплоя не работает SBER API. "
+                        "Дай план диагностики."
+                    )
+                )
+            ],
+            "tool_phase": "business",
+            "model_call_count": 0,
+        }
     )
 
-    print("\n--- FINAL ANSWER ---")
-    print(result["messages"][-1].content)
+    print(last_useful_ai_text(result))
 
 
 if __name__ == "__main__":
